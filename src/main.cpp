@@ -14,17 +14,13 @@ const unordered_set<string> listCommands = {"type", "echo", "exit", "pwd", "cd"}
 void exitCommand() { exit(0); }
 
 void echoCommand(vector<string> &p) {
-  if (p.size() == 1) {
-    cout << endl;
-    return;
-  }
   for (size_t i = 1; i < p.size(); i++) {
-    if (i == (p.size() - 1)) {
-      cout << p[i] << endl;
-      return;
+    cout << p[i];
+    if (i < p.size() - 1) {
+      cout << " ";
     }
-    cout << p[i] << " ";
   }
+  cout << endl;
 }
 
 void pwdCommand() {
@@ -52,10 +48,44 @@ void cdCommand(const vector<string> &splitwords) {
 }
 
 void splitwords(string &command, vector<string> &splitted) {
-  stringstream s(command);
-  string token;
-  while (s >> token) {
-    splitted.push_back(token);
+  string current_arg = "";
+  bool in_single_quotes = false;
+  bool inside_word = false; // Tracks if we are actively building an argument
+
+  for (size_t i = 0; i < command.length(); ++i) {
+    char c = command[i];
+
+    if (in_single_quotes) {
+      if (c == '\'') {
+        // Toggle single quotes off
+        in_single_quotes = false;
+      } else {
+        // Everything inside single quotes is treated literally
+        current_arg += c;
+      }
+    } else {
+      if (c == '\'') {
+        // Toggle single quotes on
+        in_single_quotes = true;
+        inside_word = true; // Quotes initiate an argument string
+      } else if (c == ' ') {
+        // If we hit a space outside quotes and were building a word, push it
+        if (inside_word) {
+          splitted.push_back(current_arg);
+          current_arg = "";
+          inside_word = false;
+        }
+      } else {
+        // Normal characters outside quotes
+        current_arg += c;
+        inside_word = true;
+      }
+    }
+  }
+
+  // Push the final remaining argument if the command line ends without a trailing space
+  if (inside_word) {
+    splitted.push_back(current_arg);
   }
 }
 
