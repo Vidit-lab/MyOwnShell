@@ -31,16 +31,16 @@ void pwdCommand() {
   cout << std::filesystem::current_path().string() << endl;
 }
 
-// Builtin handler for the "cd" command (handling absolute paths)
+// Builtin handler for the "cd" command (handling all paths)
 void cdCommand(const vector<string> &splitwords) {
   if (splitwords.size() < 2) return;
 
-  string target_dir = splitwords[1];
+  std::filesystem::path target_dir = splitwords[1];
 
   if (std::filesystem::exists(target_dir) && std::filesystem::is_directory(target_dir)) {
     std::filesystem::current_path(target_dir); 
   } else {
-    cout << "cd: " << target_dir << ": No such file or directory\n";
+    cout << "cd: " << splitwords[1] << ": No such file or directory\n";
   }
 }
 
