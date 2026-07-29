@@ -35,7 +35,14 @@ void pwdCommand() {
 void cdCommand(const vector<string> &splitwords) {
   if (splitwords.size() < 2) return;
 
-  std::filesystem::path target_dir = splitwords[1];
+  string target_str = splitwords[1];
+
+  if (target_str == "~") {
+    const char* home_env = getenv("HOME");
+    target_str = home_env ? home_env : "";
+  }
+
+  std::filesystem::path target_dir = target_str;
 
   if (std::filesystem::exists(target_dir) && std::filesystem::is_directory(target_dir)) {
     std::filesystem::current_path(target_dir); 
