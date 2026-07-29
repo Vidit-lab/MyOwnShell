@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 using namespace std;
-const unordered_set<string> listCommands = {"type", "echo", "exit", "pwd"};
+const unordered_set<string> listCommands = {"type", "echo", "exit", "pwd", "cd"};
 
 void exitCommand() { exit(0); }
 
@@ -29,6 +29,19 @@ void echoCommand(vector<string> &p) {
 
 void pwdCommand() {
   cout << std::filesystem::current_path().string() << endl;
+}
+
+// Builtin handler for the "cd" command (handling absolute paths)
+void cdCommand(const vector<string> &splitwords) {
+  if (splitwords.size() < 2) return;
+
+  string target_dir = splitwords[1];
+
+  if (std::filesystem::exists(target_dir) && std::filesystem::is_directory(target_dir)) {
+    std::filesystem::current_path(target_dir); 
+  } else {
+    cout << "cd: " << target_dir << ": No such file or directory\n";
+  }
 }
 
 void splitwords(string &command, vector<string> &splitted) {
@@ -105,7 +118,9 @@ void commandEx(vector<string> &splitwords) {
     typeCommand(splitwords);
   } else if (cmd == "pwd") { 
     pwdCommand();
-  } else {
+  } else if (cmd == "cd") { 
+    cdCommand(splitwords);
+  }else {
     externalProgram(splitwords);
   }
 }
