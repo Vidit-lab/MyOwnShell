@@ -4,11 +4,12 @@
 #include <vector>
 #include <unordered_set>
 #include <cstdlib>
+#include <filesystem>
 #include <sys/wait.h>
 #include <unistd.h>
 
 using namespace std;
-const unordered_set<string> listCommands = {"type", "echo", "exit"};
+const unordered_set<string> listCommands = {"type", "echo", "exit", "pwd"};
 
 void exitCommand() { exit(0); }
 
@@ -26,7 +27,10 @@ void echoCommand(vector<string> &p) {
   }
 }
 
-// FIX: Changed to stream-extraction mode to automatically discard consecutive spaces
+void pwdCommand() {
+  cout << std::filesystem::current_path().string() << endl;
+}
+
 void splitwords(string &command, vector<string> &splitted) {
   stringstream s(command);
   string token;
@@ -99,6 +103,8 @@ void commandEx(vector<string> &splitwords) {
     echoCommand(splitwords);
   } else if (cmd == "type") {
     typeCommand(splitwords);
+  } else if (cmd == "pwd") { 
+    pwdCommand();
   } else {
     externalProgram(splitwords);
   }
