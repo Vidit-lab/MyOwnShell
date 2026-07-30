@@ -175,7 +175,8 @@ void executeCommand(const vector<string> &splitwords) {
   if (pid == 0) { // CHILD PROCESS INNER LOGIC
     string redirect_file = "";
     bool do_redirect = false;
-    int target_fd = STDOUT_FILENO; // Default redirection target is stdout (1)
+    int target_fd = STDOUT_FILENO;
+    int open_flags = O_WRONLY | O_CREAT; // Base file creation flags
     size_t redirect_idx = 0;
 
     // Scan arguments inside the isolated process space
@@ -184,15 +185,35 @@ void executeCommand(const vector<string> &splitwords) {
         if (i + 1 < splitwords.size()) {
           redirect_file = splitwords[i + 1];
           do_redirect = true;
-          target_fd = STDOUT_FILENO; // Overwrite descriptor 1
+          target_fd = STDOUT_FILENO;
+          open_flags |= O_TRUNC; 
           redirect_idx = i;
           break;
         }
-      } else if (splitwords[i] == "2>") { // Capture standard error token
+      } else if (splitwords[i] == "2>") {
         if (i + 1 < splitwords.size()) {
           redirect_file = splitwords[i + 1];
           do_redirect = true;
-          target_fd = STDERR_FILENO; // Overwrite descriptor 2
+          target_fd = STDERR_FILENO;
+          open_flags |= O_TRUNC; 
+          redirect_idx = i;
+          break;
+        }
+      } else if (splitwords[i] == ">>" || splitwords[i] == "1>>") { // Capture stdout append
+        if (i + 1 < splitwords.size()) {
+          redirect_file = splitwords[i + 1];
+          do_redirect = true;
+          target_fd = STDOUT_FILENO;
+          open_flags |= O_APPEND; 
+          redirect_idx = i;
+          break;
+        }
+      } else if (splitwords[i] == "2>>") { // Capture stderr append
+        if (i + 1 < splitwords.size()) {
+          redirect_file = splitwords[i + 1];
+          do_redirect = true;
+          target_fd = STDERR_FILENO; 
+          open_flags |= O_APPEND;    
           redirect_idx = i;
           break;
         }
@@ -207,7 +228,7 @@ void executeCommand(const vector<string> &splitwords) {
     if (active_args.empty()) exit(0);
 
     if (do_redirect) {
-      int file_fd = open(redirect_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      int file_fd = open(redirect_file.c_str(), open_flags, 0644);
       if (file_fd < 0) {
         perror("open failed");
         exit(1);
