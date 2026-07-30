@@ -63,15 +63,35 @@ void splitwords(string &command, vector<string> &splitted) {
         current_arg += c;
       }
     } else if (in_double_quotes) {
-      if (c == '"') {
+      if (c == '\\') {
+        if (i + 1 < command.length()) {
+          char next_c = command[i + 1];
+
+          // Handles all 5 valid escape characters inside double quotes
+          if (next_c == '"' || next_c == '\\' || next_c == '$' || next_c == '`') {
+
+            i++; 
+            current_arg += next_c; // Treat the next character as a literal
+
+          } else if (next_c == '\n') {
+
+            i++; //remove both the backslash and the newline completely
+
+          } else {
+
+            current_arg += c;
+            
+          }
+        } else {
+          current_arg += c;
+        }
+      } else if (c == '"') {
         in_double_quotes = false;
       } else {
-        current_arg += c; 
+        current_arg += c;
       }
     } else {
-      
       if (c == '\\') {
-        //Treat the next character literally, dropping the backslash
         if (i + 1 < command.length()) {
           i++; 
           current_arg += command[i];
@@ -81,7 +101,7 @@ void splitwords(string &command, vector<string> &splitted) {
         in_single_quotes = true;
         inside_word = true;
       } else if (c == '"') {
-        in_double_quotes = true; 
+        in_double_quotes = true;
         inside_word = true;
       } else if (c == ' ') {
         if (inside_word) {
