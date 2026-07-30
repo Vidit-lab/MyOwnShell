@@ -175,6 +175,7 @@ void executeCommand(const vector<string> &splitwords) {
   if (pid == 0) { // CHILD PROCESS INNER LOGIC
     string redirect_file = "";
     bool do_redirect = false;
+    int target_fd = STDOUT_FILENO; // Default redirection target is stdout (1)
     size_t redirect_idx = 0;
 
     // Scan arguments inside the isolated process space
@@ -183,6 +184,15 @@ void executeCommand(const vector<string> &splitwords) {
         if (i + 1 < splitwords.size()) {
           redirect_file = splitwords[i + 1];
           do_redirect = true;
+          target_fd = STDOUT_FILENO; // Overwrite descriptor 1
+          redirect_idx = i;
+          break;
+        }
+      } else if (splitwords[i] == "2>") { // Capture standard error token
+        if (i + 1 < splitwords.size()) {
+          redirect_file = splitwords[i + 1];
+          do_redirect = true;
+          target_fd = STDERR_FILENO; // Overwrite descriptor 2
           redirect_idx = i;
           break;
         }
@@ -202,7 +212,7 @@ void executeCommand(const vector<string> &splitwords) {
         perror("open failed");
         exit(1);
       }
-      dup2(file_fd, STDOUT_FILENO); // Overwrites only the child's stdout
+      dup2(file_fd, target_fd); // Overwrites only the child's stdout
       close(file_fd);
     }
 
