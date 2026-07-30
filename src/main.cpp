@@ -70,7 +70,14 @@ void splitwords(string &command, vector<string> &splitted) {
       }
     } else {
       
-      if (c == '\'') {
+      if (c == '\\') {
+        //Treat the next character literally, dropping the backslash
+        if (i + 1 < command.length()) {
+          i++; 
+          current_arg += command[i];
+          inside_word = true;
+        }
+      } else if (c == '\'') {
         in_single_quotes = true;
         inside_word = true;
       } else if (c == '"') {
