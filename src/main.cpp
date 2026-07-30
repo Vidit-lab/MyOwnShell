@@ -7,18 +7,19 @@
 #include <filesystem>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 using namespace std;
 const unordered_set<string> listCommands = {"type", "echo", "exit", "pwd", "cd"};
 
-void exitCommand() { exit(0); }
+// ==========================================
+// 1. Core Core Built-in Handlers
+// ==========================================
 
-void echoCommand(vector<string> &p) {
+void echoCommand(const vector<string> &p) {
   for (size_t i = 1; i < p.size(); i++) {
     cout << p[i];
-    if (i < p.size() - 1) {
-      cout << " ";
-    }
+    if (i < p.size() - 1) cout << " ";
   }
   cout << endl;
 }
@@ -27,27 +28,57 @@ void pwdCommand() {
   cout << std::filesystem::current_path().string() << endl;
 }
 
-// Builtin handler for the "cd" command (handling all paths)
-void cdCommand(const vector<string> &splitwords) {
+void typeCommand(const vector<string> &splitwords) {
   if (splitwords.size() < 2) return;
-
-  string target_str = splitwords[1];
-
-  if (target_str == "~") {
-    const char* home_env = getenv("HOME");
-    target_str = home_env ? home_env : "";
+  string cmd = splitwords[1];
+  if (listCommands.count(cmd)) {
+    cout << cmd << " is a shell builtin\n";
+    return;
   }
-
-  std::filesystem::path target_dir = target_str;
-
-  if (std::filesystem::exists(target_dir) && std::filesystem::is_directory(target_dir)) {
-    std::filesystem::current_path(target_dir); 
-  } else {
-    cout << "cd: " << splitwords[1] << ": No such file or directory\n";
+  
+  const char* env_path = getenv("PATH");
+  string pathvar = env_path ? env_path : "";
+  istringstream path_stream(pathvar);
+  string pathsplit;
+  while (getline(path_stream, pathsplit, ':')) {
+    string filepath = pathsplit + '/' + cmd;
+    if (access(filepath.c_str(), X_OK) == 0) {
+      cout << cmd << " is " << filepath << endl;
+      return;
+    }
   }
+  cout << cmd << ": not found\n";
 }
 
-void splitwords(string &command, vector<string> &splitted) {
+void externalProgram(const vector<string> &splitwords) {
+  string cmd = splitwords[0];
+  const char* env_path = getenv("PATH");
+  string pathvar = env_path ? env_path : "";
+  istringstream path_stream(pathvar);
+  string pathsplit;
+  while (getline(path_stream, pathsplit, ':')) {
+    string filepath = pathsplit + '/' + cmd;
+    if (access(filepath.c_str(), X_OK) == 0) {
+      vector<char *> argv;
+      for (auto &a : splitwords) {
+        argv.push_back(const_cast<char*>(a.c_str()));
+      }
+      argv.push_back(nullptr);
+
+      execv(filepath.c_str(), argv.data());
+      perror("execv failed");
+      exit(1);
+    }
+  }
+  cout << cmd << ": not found\n";
+  exit(1);
+}
+
+// ==========================================
+// 2. State-Machine Argument Parser
+// ==========================================
+
+void splitwords(const string &command, vector<string> &splitted) {
   string current_arg = "";
   bool in_single_quotes = false;
   bool in_double_quotes = false;
@@ -57,30 +88,19 @@ void splitwords(string &command, vector<string> &splitted) {
     char c = command[i];
 
     if (in_single_quotes) {
-      if (c == '\'') {
-        in_single_quotes = false;
-      } else {
-        current_arg += c;
-      }
+      if (c == '\'') in_single_quotes = false;
+      else current_arg += c;
     } else if (in_double_quotes) {
       if (c == '\\') {
         if (i + 1 < command.length()) {
           char next_c = command[i + 1];
-
-          // Handles all 5 valid escape characters inside double quotes
           if (next_c == '"' || next_c == '\\' || next_c == '$' || next_c == '`') {
-
             i++; 
-            current_arg += next_c; // Treat the next character as a literal
-
+            current_arg += next_c;
           } else if (next_c == '\n') {
-
-            i++; //remove both the backslash and the newline completely
-
+            i++; 
           } else {
-
-            current_arg += c;
-            
+            current_arg += c; 
           }
         } else {
           current_arg += c;
@@ -115,82 +135,92 @@ void splitwords(string &command, vector<string> &splitted) {
       }
     }
   }
-
-  if (inside_word) {
-    splitted.push_back(current_arg);
-  }
+  if (inside_word) splitted.push_back(current_arg);
 }
 
-void typeCommand(vector<string> &splitwords) {
-  if (splitwords.size() < 2) return; // Guard clause against missing arguments
-  string cmd = splitwords[1];
-  if (listCommands.count(cmd)) {
-    cout << cmd << " is a shell builtin\n";
-    return;
-  } else {
-    const char* env_path = getenv("PATH");
-    string pathvar = env_path ? env_path : "";
-    istringstream path_stream(pathvar);
-    string pathsplit;
-    while (getline(path_stream, pathsplit, ':')) {
-      string filepath = pathsplit + '/' + cmd;
-      if (access(filepath.c_str(), X_OK) == 0) {
-        cout << cmd << " is " << filepath << endl;
-        return;
-      }
-    }
-  }
-  cout << cmd << ": not found\n";
-}
+// ==========================================
+// 3. Command Routing and Execution Engine
+// ==========================================
 
-void externalProgram(vector<string> &splitwords) {
+void executeCommand(const vector<string> &splitwords) {
+  if (splitwords.empty()) return;
   string cmd = splitwords[0];
-  const char* env_path = getenv("PATH");
-  string pathvar = env_path ? env_path : "";
-  istringstream path_stream(pathvar);
-  string pathsplit;
-  while (getline(path_stream, pathsplit, ':')) {
-    string filepath = pathsplit + '/' + cmd;
-    if (access(filepath.c_str(), X_OK) == 0) {
-      vector<char *> argv;
-      for (auto &a : splitwords) {
-        // Industry-standard casting for low-level system exec boundaries
-        argv.push_back(const_cast<char*>(a.c_str()));
-      }
-      argv.push_back(nullptr);
 
-      pid_t pid = fork();
-      if (pid == 0) {
-        execv(filepath.c_str(), argv.data());
-        perror("execv failed");
-        exit(1);
-      } else if (pid > 0) {
-        int status;
-        waitpid(pid, &status, 0);
-      } else {
-        perror("fork failed");
-      }
-      return;
-    }
-  }
-  cout << cmd << ": not found\n";
-}
-
-void commandEx(vector<string> &splitwords) {
-  if (splitwords.empty()) return; // FIX: Protects against out-of-bounds crashes on blank enter
-  string cmd = splitwords[0];
+  // 1. Handle state-modifying built-ins immediately in the parent process
   if (cmd == "exit") {
-    exitCommand();
-  } else if (cmd == "echo") {
-    echoCommand(splitwords);
-  } else if (cmd == "type") {
-    typeCommand(splitwords);
-  } else if (cmd == "pwd") { 
-    pwdCommand();
-  } else if (cmd == "cd") { 
-    cdCommand(splitwords);
-  }else {
-    externalProgram(splitwords);
+    exit(0);
+  }
+  if (cmd == "cd") {
+    if (splitwords.size() < 2) return;
+    string target = splitwords[1];
+    if (target == "~") {
+      const char* home = getenv("HOME");
+      target = home ? home : "";
+    }
+    if (std::filesystem::exists(target) && std::filesystem::is_directory(target)) {
+      std::filesystem::current_path(target);
+    } else {
+      cout << "cd: " << splitwords[1] << ": No such file or directory\n";
+    }
+    return;
+  }
+
+  // 2. Fork isolated child for all other execution profiles
+  pid_t pid = fork();
+  if (pid == -1) {
+    perror("fork failed");
+    return;
+  }
+
+  if (pid == 0) { // CHILD PROCESS INNER LOGIC
+    string redirect_file = "";
+    bool do_redirect = false;
+    size_t redirect_idx = 0;
+
+    // Scan arguments inside the isolated process space
+    for (size_t i = 0; i < splitwords.size(); ++i) {
+      if (splitwords[i] == ">" || splitwords[i] == "1>") {
+        if (i + 1 < splitwords.size()) {
+          redirect_file = splitwords[i + 1];
+          do_redirect = true;
+          redirect_idx = i;
+          break;
+        }
+      }
+    }
+
+    vector<string> active_args = splitwords;
+    if (do_redirect) {
+      active_args.resize(redirect_idx); // Strip out redirection tokens
+    }
+
+    if (active_args.empty()) exit(0);
+
+    if (do_redirect) {
+      int file_fd = open(redirect_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (file_fd < 0) {
+        perror("open failed");
+        exit(1);
+      }
+      dup2(file_fd, STDOUT_FILENO); // Overwrites only the child's stdout
+      close(file_fd);
+    }
+
+    string child_cmd = active_args[0];
+    if (child_cmd == "echo") {
+      echoCommand(active_args);
+    } else if (child_cmd == "type") {
+      typeCommand(active_args);
+    } else if (child_cmd == "pwd") {
+      pwdCommand();
+    } else {
+      externalProgram(active_args);
+    }
+    exit(0); // Safely terminate the child; the OS drops and closes all file descriptors
+  } 
+  else { // PARENT PROCESS INNER LOGIC
+    int status;
+    waitpid(pid, &status, 0); // Block until child exits cleanly
   }
 }
 
@@ -201,11 +231,10 @@ int main() {
   while (1) {
     cout << "$ ";
     string command;
-    if (!getline(cin, command)) break; // Guard against EOF/Ctrl+D hanging loops
+    if (!getline(cin, command)) break;
     vector<string> splitcommand;
     splitwords(command, splitcommand);
-    commandEx(splitcommand);
+    executeCommand(splitcommand);
   }
-
   return 0;
 }
