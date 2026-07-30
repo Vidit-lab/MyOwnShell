@@ -50,40 +50,45 @@ void cdCommand(const vector<string> &splitwords) {
 void splitwords(string &command, vector<string> &splitted) {
   string current_arg = "";
   bool in_single_quotes = false;
-  bool inside_word = false; // Tracks if we are actively building an argument
+  bool in_double_quotes = false;
+  bool inside_word = false;
 
   for (size_t i = 0; i < command.length(); ++i) {
     char c = command[i];
 
     if (in_single_quotes) {
       if (c == '\'') {
-        // Toggle single quotes off
         in_single_quotes = false;
       } else {
-        // Everything inside single quotes is treated literally
         current_arg += c;
       }
+    } else if (in_double_quotes) {
+      if (c == '"') {
+        in_double_quotes = false;
+      } else {
+        current_arg += c; 
+      }
     } else {
+      
       if (c == '\'') {
-        // Toggle single quotes on
         in_single_quotes = true;
-        inside_word = true; // Quotes initiate an argument string
+        inside_word = true;
+      } else if (c == '"') {
+        in_double_quotes = true; 
+        inside_word = true;
       } else if (c == ' ') {
-        // If we hit a space outside quotes and were building a word, push it
         if (inside_word) {
           splitted.push_back(current_arg);
           current_arg = "";
           inside_word = false;
         }
       } else {
-        // Normal characters outside quotes
         current_arg += c;
         inside_word = true;
       }
     }
   }
 
-  // Push the final remaining argument if the command line ends without a trailing space
   if (inside_word) {
     splitted.push_back(current_arg);
   }
