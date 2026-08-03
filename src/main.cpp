@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_set>
 #include <set>
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <sys/wait.h>
@@ -17,6 +18,7 @@ namespace fs = std::filesystem;
 // ==========================================
 // 0. Global Registry Configuration
 // ==========================================
+
 const vector<string> builtinCommands = {"echo", "exit", "pwd", "cd", "type"};
 const unordered_set<string> listCommands(builtinCommands.begin(), builtinCommands.end());
 
@@ -31,6 +33,7 @@ struct RedirectionConfig {
 // ==========================================
 // 1. Core Built-in Handlers
 // ==========================================
+
 void echoCommand(const vector<string> &p) {
   for (size_t i = 1; i < p.size(); i++) {
     cout << p[i];
@@ -92,6 +95,7 @@ void externalProgram(const vector<string> &splitwords) {
 // ==========================================
 // 2. State-Machine Argument Parser
 // ==========================================
+
 void splitwords(const string &command, vector<string> &splitted) {
   string current_arg = "";
   bool in_single_quotes = false;
@@ -153,9 +157,11 @@ void splitwords(const string &command, vector<string> &splitted) {
 }
 
 // ==========================================
-// 3. Dynamic Executable Completion Engine
+// 3. Completion Engines (commands + filenames)
 // ==========================================
-vector<string> get_all_completions(const string &prefix) {
+
+// Candidates for the first word: shell builtins and executables on PATH.
+vector<string> get_command_completions(const string &prefix) {
   if (prefix.empty()) return {};
 
   set<string> unique_matches;
@@ -193,6 +199,35 @@ vector<string> get_all_completions(const string &prefix) {
   }
 
   return vector<string>(unique_matches.begin(), unique_matches.end());
+}
+
+
+vector<string> get_file_completions(const string &word) {
+  // Split the word at its last '/': everything up to and including it is the
+  // directory to look inside; the remainder is the prefix we match names on.
+  size_t slash = word.find_last_of('/');
+  string dir_part = (slash == string::npos) ? "" : word.substr(0, slash + 1);
+  string leaf     = (slash == string::npos) ? word : word.substr(slash + 1);
+
+  string scan_dir = dir_part.empty() ? "." : dir_part;
+
+  vector<string> matches;
+  error_code ec;
+  if (!fs::is_directory(scan_dir, ec)) return matches;
+
+  // Dotfiles stay hidden unless the user explicitly starts the leaf with '.'.
+  bool want_hidden = !leaf.empty() && leaf[0] == '.';
+
+  for (const auto& entry : fs::directory_iterator(scan_dir, ec)) {
+    string name = entry.path().filename().string();
+    if (!want_hidden && !name.empty() && name[0] == '.') continue;
+    if (name.rfind(leaf, 0) == 0) {
+      matches.push_back(dir_part + name);
+    }
+  }
+
+  sort(matches.begin(), matches.end());
+  return matches;
 }
 
 // Longest common prefix across all matches: lets Tab extend as far as it can
@@ -246,54 +281,73 @@ string read_line_raw() {
       break;
     }
     else if (ch == '\t') {
-      // Command completion only for now. Once there's a space we're completing
-      // an argument (file/path completion) which isn't implemented yet.
-      if (current_line.find(' ') != string::npos) {
+      // Complete the LAST word on the line. If it's the first word (no space
+      // before it) we're naming a command; otherwise we're naming a file.
+      size_t sp = current_line.find_last_of(' ');
+      bool completing_command = (sp == string::npos);
+      string word      = completing_command ? current_line : current_line.substr(sp + 1);
+      string line_head = completing_command ? ""           : current_line.substr(0, sp + 1);
+
+      vector<string> matches = completing_command
+                                 ? get_command_completions(word)
+                                 : get_file_completions(word);
+
+      if (matches.empty()) {
         cout << "\a" << std::flush;
-      }  else {
-        // matches comes from a set<string>, so it's already alphabetically sorted.
-        vector<string> matches = get_all_completions(current_line);
- 
-        if (matches.empty()) {
+        prev_tab = false;
+      } else if (matches.size() == 1) {
+        // A directory keeps you moving: append '/' and no space. Everything
+        // else is a finished token, so append a space.
+        const string& sole = matches[0];
+        bool is_dir = !completing_command && fs::is_directory(sole);
+        string suffix = is_dir ? "/" : " ";
+
+        string appended = sole.substr(word.length()) + suffix;
+        current_line = line_head + sole + suffix;
+        cout << appended << std::flush;
+        prev_tab = false;
+      } else {
+        string lcp = longest_common_prefix(matches);
+        if (lcp.size() > word.size()) {
+          // Shared prefix is longer than what's typed: extend to it.
+          // Still ambiguous afterwards, so the next Tab starts the bell/list cycle.
+          string appended = lcp.substr(word.length());
+          current_line = line_head + lcp;
+          cout << appended << std::flush;
+          prev_tab = false;
+        } else if (!prev_tab) {
+          // First Tab on an ambiguous prefix: ring the bell and remember it.
           cout << "\a" << std::flush;
-          prev_tab = false;
-        } else if (matches.size() == 1) {
-          string completion = matches[0].substr(current_line.length()) + " ";
-          current_line = matches[0] + " ";
-          cout << completion << std::flush;
-          prev_tab = false;
+          prev_tab = true;
         } else {
-          string lcp = longest_common_prefix(matches);
-          if (lcp.size() > current_line.size()) {
-            string completion = lcp.substr(current_line.length());
-            current_line = lcp;
-            cout << completion << std::flush;
-            prev_tab = false;
-          } else if (!prev_tab) {
-            cout << "\a" << std::flush;
-            prev_tab = true;
-          } else {
-            cout << "\n";
-            for (size_t i = 0; i < matches.size(); ++i) {
-              if (i > 0) cout << "  ";
-              cout << matches[i];
-            }
-            cout << "\n$ " << current_line << std::flush;
-            prev_tab = false;
+          // Second consecutive Tab: list every match on a fresh line, two
+          // spaces apart, then redraw the prompt with the typed line intact.
+          // Show the basename (part after the last '/'), and mark directories
+          // with a trailing '/' so they're distinguishable from plain files.
+          cout << "\n";
+          for (size_t i = 0; i < matches.size(); ++i) {
+            if (i > 0) cout << "  ";
+            const string& m = matches[i];
+            string base = m.substr(m.find_last_of('/') + 1);
+            if (!completing_command && fs::is_directory(m)) base += "/";
+            cout << base;
           }
+          cout << "\n$ " << current_line << std::flush;
+          prev_tab = false;
         }
       }
     }
-
     else if (ch == 127 || ch == 8) {
       if (!current_line.empty()) {
         current_line.pop_back();
         cout << "\b \b" << std::flush;
       }
+      prev_tab = false;
     }
     else {
       current_line += ch;
       cout << ch << std::flush;
+      prev_tab = false;
     }
   }
 
@@ -331,7 +385,6 @@ RedirectionConfig parse_redirection(const vector<string> &splitwords) {
 // ==========================================
 // 6. Command Routing and Execution Engine
 // ==========================================
-
 void executeCommand(const vector<string> &splitwords) {
   if (splitwords.empty()) return;
   string cmd = splitwords[0];
@@ -397,10 +450,6 @@ void executeCommand(const vector<string> &splitwords) {
     waitpid(pid, &status, 0);
   }
 }
-
-// ==========================================
-// 7. Main Program Loop
-// ==========================================
 
 int main() {
   std::cout << std::unitbuf;
