@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_set>
 #include <set>
+#include <map>
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -15,12 +16,12 @@
 using namespace std;
 namespace fs = std::filesystem;
 
-// ==========================================
-// 0. Global Registry Configuration
-// ==========================================
-
-const vector<string> builtinCommands = {"echo", "exit", "pwd", "cd", "type"};
+// Single source of truth for builtins; type + completion derive from this.
+const vector<string> builtinCommands = {"echo", "exit", "pwd", "cd", "type", "complete"};
 const unordered_set<string> listCommands(builtinCommands.begin(), builtinCommands.end());
+
+// command -> completer script path, registered via `complete -C`.
+map<string, string> completionSpecs;
 
 struct RedirectionConfig {
   bool active = false;
@@ -30,9 +31,7 @@ struct RedirectionConfig {
   size_t operator_idx = 0;
 };
 
-// ==========================================
-// 1. Core Built-in Handlers
-// ==========================================
+// ---- Built-in handlers ----
 
 void echoCommand(const vector<string> &p) {
   for (size_t i = 1; i < p.size(); i++) {
@@ -92,9 +91,7 @@ void externalProgram(const vector<string> &splitwords) {
   exit(1);
 }
 
-// ==========================================
-// 2. State-Machine Argument Parser
-// ==========================================
+// ---- Argument parser (quote/escape aware) ----
 
 void splitwords(const string &command, vector<string> &splitted) {
   string current_arg = "";
@@ -156,11 +153,9 @@ void splitwords(const string &command, vector<string> &splitted) {
   if (inside_word) splitted.push_back(current_arg);
 }
 
-// ==========================================
-// 3. Completion Engines (commands + filenames)
-// ==========================================
+// ---- Completion engines ----
 
-// Candidates for the first word: shell builtins and executables on PATH.
+// First word: builtins + executables on PATH.
 vector<string> get_command_completions(const string &prefix) {
   if (prefix.empty()) return {};
 
@@ -190,21 +185,20 @@ vector<string> get_command_completions(const string &prefix) {
             unique_matches.insert(filename);
           }
         } catch (...) {
-          continue; // skip a single bad entry (e.g. broken symlink), keep scanning
+          continue;
         }
       }
     } catch (...) {
-      continue; // skip an unreadable directory entirely
+      continue;
     }
   }
 
   return vector<string>(unique_matches.begin(), unique_matches.end());
 }
 
-
+// Argument words: files/dirs matching the word. A word like "src/ma" scans
+// "src/" and matches "ma"; each candidate is the full word form for splicing.
 vector<string> get_file_completions(const string &word) {
-  // Split the word at its last '/': everything up to and including it is the
-  // directory to look inside; the remainder is the prefix we match names on.
   size_t slash = word.find_last_of('/');
   string dir_part = (slash == string::npos) ? "" : word.substr(0, slash + 1);
   string leaf     = (slash == string::npos) ? word : word.substr(slash + 1);
@@ -215,7 +209,6 @@ vector<string> get_file_completions(const string &word) {
   error_code ec;
   if (!fs::is_directory(scan_dir, ec)) return matches;
 
-  // Dotfiles stay hidden unless the user explicitly starts the leaf with '.'.
   bool want_hidden = !leaf.empty() && leaf[0] == '.';
 
   for (const auto& entry : fs::directory_iterator(scan_dir, ec)) {
@@ -230,8 +223,6 @@ vector<string> get_file_completions(const string &word) {
   return matches;
 }
 
-// Longest common prefix across all matches: lets Tab extend as far as it can
-// unambiguously before it has to give up and ring the bell.
 string longest_common_prefix(const vector<string>& v) {
   if (v.empty()) return "";
   string p = v[0];
@@ -244,9 +235,54 @@ string longest_common_prefix(const vector<string>& v) {
   return p;
 }
 
-// ==========================================
-// 4. Isolated Live Input Driver
-// ==========================================
+// ---- Raw-mode line editor with Tab completion ----
+
+// Run a registered completer script, feeding it bash's standard completion
+// args (command name, current word, previous word), and return its stdout
+// lines as candidates.
+vector<string> run_completer(const string& script, const string& cmd_name,
+                             const string& cur_word, const string& prev_word,
+                             const string& comp_line, size_t comp_point) {
+  int fds[2];
+  if (pipe(fds) < 0) return {};
+
+  pid_t pid = fork();
+  if (pid < 0) { close(fds[0]); close(fds[1]); return {}; }
+
+  if (pid == 0) {
+    dup2(fds[1], STDOUT_FILENO);
+    close(fds[0]);
+    close(fds[1]);
+    setenv("COMP_LINE", comp_line.c_str(), 1);
+    setenv("COMP_POINT", to_string(comp_point).c_str(), 1);
+    vector<char*> argv = {
+      const_cast<char*>(script.c_str()),
+      const_cast<char*>(cmd_name.c_str()),
+      const_cast<char*>(cur_word.c_str()),
+      const_cast<char*>(prev_word.c_str()),
+      nullptr
+    };
+    execv(script.c_str(), argv.data());
+    _exit(127);
+  }
+
+  close(fds[1]);
+  string out;
+  char buf[4096];
+  ssize_t n;
+  while ((n = read(fds[0], buf, sizeof(buf))) > 0) out.append(buf, n);
+  close(fds[0]);
+  waitpid(pid, nullptr, 0);
+
+  vector<string> lines;
+  istringstream iss(out);
+  string line;
+  while (getline(iss, line)) {
+    if (!line.empty()) lines.push_back(line);
+  }
+  return lines;
+}
+
 string read_line_raw() {
   struct termios original_terminal;
   if (tcgetattr(STDIN_FILENO, &original_terminal) < 0) {
@@ -261,19 +297,18 @@ string read_line_raw() {
 
   string current_line = "";
   char ch;
-  bool prev_tab = false;   // was the previous keypress also a Tab?
+  bool prev_tab = false;
 
   while (true) {
     ssize_t n = read(STDIN_FILENO, &ch, 1);
 
     if (n <= 0) {
-      // EOF (Ctrl-D) or read error.
       if (current_line.empty()) {
         tcsetattr(STDIN_FILENO, TCSANOW, &original_terminal);
         cout << endl;
-        exit(0);            // bash-like: Ctrl-D on an empty line exits the shell
+        exit(0);            // Ctrl-D on an empty line exits
       }
-      break;                // partial line typed: execute what we have
+      break;                // partial line: run what we have
     }
 
     if (ch == '\n') {
@@ -281,26 +316,38 @@ string read_line_raw() {
       break;
     }
     else if (ch == '\t') {
-      // Complete the LAST word on the line. If it's the first word (no space
-      // before it) we're naming a command; otherwise we're naming a file.
+      // Complete the last word: first word => command, otherwise => filename.
       size_t sp = current_line.find_last_of(' ');
       bool completing_command = (sp == string::npos);
       string word      = completing_command ? current_line : current_line.substr(sp + 1);
       string line_head = completing_command ? ""           : current_line.substr(0, sp + 1);
 
-      vector<string> matches = completing_command
-                                 ? get_command_completions(word)
-                                 : get_file_completions(word);
+      vector<string> matches;
+      bool from_filesystem = false;
+      if (completing_command) {
+        matches = get_command_completions(word);
+      } else {
+        vector<string> head_tokens;
+        splitwords(line_head, head_tokens);
+        string command_name = head_tokens.empty() ? "" : head_tokens.front();
+        string prev_word    = head_tokens.empty() ? "" : head_tokens.back();
+        auto it = completionSpecs.find(command_name);
+        if (it != completionSpecs.end()) {
+          matches = run_completer(it->second, command_name, word, prev_word,
+                                  current_line, current_line.length());
+        } else {
+          matches = get_file_completions(word);
+          from_filesystem = true;
+        }
+      }
 
       if (matches.empty()) {
         cout << "\a" << std::flush;
         prev_tab = false;
       } else if (matches.size() == 1) {
-        // A directory keeps you moving: append '/' and no space. Everything
-        // else is a finished token, so append a space.
         const string& sole = matches[0];
-        bool is_dir = !completing_command && fs::is_directory(sole);
-        string suffix = is_dir ? "/" : " ";
+        bool is_dir = from_filesystem && fs::is_directory(sole);
+        string suffix = is_dir ? "/" : " ";   // dir keeps you moving, file closes the token
 
         string appended = sole.substr(word.length()) + suffix;
         current_line = line_head + sole + suffix;
@@ -309,27 +356,21 @@ string read_line_raw() {
       } else {
         string lcp = longest_common_prefix(matches);
         if (lcp.size() > word.size()) {
-          // Shared prefix is longer than what's typed: extend to it.
-          // Still ambiguous afterwards, so the next Tab starts the bell/list cycle.
           string appended = lcp.substr(word.length());
           current_line = line_head + lcp;
           cout << appended << std::flush;
           prev_tab = false;
         } else if (!prev_tab) {
-          // First Tab on an ambiguous prefix: ring the bell and remember it.
-          cout << "\a" << std::flush;
+          cout << "\a" << std::flush;   // first Tab: bell
           prev_tab = true;
         } else {
-          // Second consecutive Tab: list every match on a fresh line, two
-          // spaces apart, then redraw the prompt with the typed line intact.
-          // Show the basename (part after the last '/'), and mark directories
-          // with a trailing '/' so they're distinguishable from plain files.
+          // second Tab: list basenames alphabetically, dirs marked with '/'
           cout << "\n";
           for (size_t i = 0; i < matches.size(); ++i) {
             if (i > 0) cout << "  ";
             const string& m = matches[i];
             string base = m.substr(m.find_last_of('/') + 1);
-            if (!completing_command && fs::is_directory(m)) base += "/";
+            if (from_filesystem && fs::is_directory(m)) base += "/";
             cout << base;
           }
           cout << "\n$ " << current_line << std::flush;
@@ -355,9 +396,8 @@ string read_line_raw() {
   return current_line;
 }
 
-// ==========================================
-// 5. Redirection Parser Helper
-// ==========================================
+// ---- Redirection parsing ----
+
 RedirectionConfig parse_redirection(const vector<string> &splitwords) {
   RedirectionConfig config;
 
@@ -382,9 +422,8 @@ RedirectionConfig parse_redirection(const vector<string> &splitwords) {
   return config;
 }
 
-// ==========================================
-// 6. Command Routing and Execution Engine
-// ==========================================
+// ---- Command routing ----
+
 void executeCommand(const vector<string> &splitwords) {
   if (splitwords.empty()) return;
   string cmd = splitwords[0];
@@ -403,6 +442,24 @@ void executeCommand(const vector<string> &splitwords) {
       fs::current_path(target);
     } else {
       cout << "cd: " << splitwords[1] << ": No such file or directory\n";
+    }
+    return;
+  }
+
+  // Parent-side: complete mutates shell state that must outlive one command.
+  if (cmd == "complete") {
+    if (splitwords.size() >= 3 && splitwords[1] == "-p") {
+      const string& name = splitwords[2];
+      auto it = completionSpecs.find(name);
+      if (it != completionSpecs.end()) {
+        cout << "complete -C '" << it->second << "' " << name << "\n";
+      } else {
+        cout << "complete: " << name << ": no completion specification\n";
+      }
+    } else if (splitwords.size() >= 4 && splitwords[1] == "-C") {
+      completionSpecs[splitwords[3]] = splitwords[2];
+    } else if (splitwords.size() >= 3 && splitwords[1] == "-r") {
+      completionSpecs.erase(splitwords[2]);
     }
     return;
   }
@@ -451,6 +508,8 @@ void executeCommand(const vector<string> &splitwords) {
   }
 }
 
+// ---- Main loop ----
+
 int main() {
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
@@ -458,7 +517,7 @@ int main() {
   while (true) {
     cout << "$ " << std::flush;
 
-    string command_line = read_line_raw();  // exits directly on Ctrl-D at empty line
+    string command_line = read_line_raw();
 
     vector<string> splitcommand;
     splitwords(command_line, splitcommand);
