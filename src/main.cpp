@@ -600,6 +600,41 @@ void executeCommand(const vector<string> &args) {
   }
 }
 
+// ---- Pipelines ----
+void runPipeline(const vector<string> &tokens) {
+  size_t bar = 0;
+  while (bar < tokens.size() && tokens[bar] != "|") ++bar;
+  vector<string> left(tokens.begin(), tokens.begin() + bar);
+  vector<string> right(tokens.begin() + bar + 1, tokens.end());
+  if (left.empty() || right.empty()) return;
+
+  int fds[2];
+  if (pipe(fds) < 0) { perror("pipe failed"); return; }
+
+  pid_t p1 = fork();
+  if (p1 == 0) {
+    dup2(fds[1], STDOUT_FILENO);   // left writes into the pipe
+    close(fds[0]);
+    close(fds[1]);
+    externalProgram(left);         // execs, or prints "not found" and exits
+    _exit(1);
+  }
+
+  pid_t p2 = fork();
+  if (p2 == 0) {
+    dup2(fds[0], STDIN_FILENO);    // right reads from the pipe
+    close(fds[0]);
+    close(fds[1]);
+    externalProgram(right);
+    _exit(1);
+  }
+
+  close(fds[0]);                    // parent holds neither end
+  close(fds[1]);
+  waitpid(p1, nullptr, 0);
+  waitpid(p2, nullptr, 0);
+}
+
 // ---- Main loop ----
 
 int main() {
@@ -614,7 +649,11 @@ int main() {
 
     vector<string> splitcommand;
     splitwords(command_line, splitcommand);
-    executeCommand(splitcommand);
+
+    if (find(splitcommand.begin(), splitcommand.end(), "|") != splitcommand.end())
+      runPipeline(splitcommand);
+    else
+      executeCommand(splitcommand);
   }
   return 0;
 }
