@@ -177,6 +177,23 @@ check "type works inside a pipeline" \
   'type echo | cat' \
   'echo is a shell builtin'
 
+# Parent-side builtins mutate state that must outlive the command, so they have
+# no child handler: inside a pipeline stage they fall through to the PATH
+# lookup and are reported as not found (on stderr, hence the empty stdout).
+check "cd in a pipeline stage does not run as a builtin" \
+  'echo x | cd /usr' \
+  ''
+
+check "jobs in a pipeline stage does not run as a builtin" \
+  'echo x | jobs' \
+  ''
+
+# '&' is stripped before builtin dispatch, so a parent-side builtin still runs
+# in the shell process and its effect persists.
+check "cd with a trailing & still changes the shell's directory" \
+  "$(printf 'cd /usr &\npwd')" \
+  '/usr'
+
 # ---- completion specs ----
 
 check "complete -C registers, -p prints" \

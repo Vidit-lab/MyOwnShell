@@ -1,3 +1,4 @@
+#include "builtins/builtins.hpp"
 #include "completion/completion_specs.hpp"
 #include "jobs/job_control.hpp"
 #include "parser/redirection.hpp"
@@ -23,39 +24,7 @@
 using namespace std;
 namespace fs = std::filesystem;
 
-// Single source of truth for builtins; type + completion derive from this.
-const vector<string> builtinCommands = {"echo", "exit", "pwd", "cd", "type", "complete", "jobs"};
-const unordered_set<string> listCommands(builtinCommands.begin(), builtinCommands.end());
-
-// ---- Built-in handlers ----
-
-void echoCommand(const vector<string> &p) {
-  for (size_t i = 1; i < p.size(); i++) {
-    cout << p[i];
-    if (i < p.size() - 1) cout << " ";
-  }
-  cout << endl;
-}
-
-void pwdCommand() {
-  cout << fs::current_path().string() << endl;
-}
-
-void typeCommand(const vector<string> &splitwords) {
-  if (splitwords.size() < 2) return;
-  string cmd = splitwords[1];
-  if (listCommands.count(cmd)) {
-    cout << cmd << " is a shell builtin\n";
-    return;
-  }
-
-  string filepath = find_executable(cmd);
-  if (!filepath.empty()) {
-    cout << cmd << " is " << filepath << endl;
-    return;
-  }
-  cout << cmd << ": not found\n";
-}
+// ---- Program execution ----
 
 void externalProgram(const vector<string> &splitwords) {
   string cmd = splitwords[0];
@@ -78,12 +47,14 @@ void externalProgram(const vector<string> &splitwords) {
 
 void runInProcess(const vector<string> &args) {
   if (args.empty()) _exit(0);
-  const string &cmd = args[0];
-  if (cmd == "echo")      echoCommand(args);
-  else if (cmd == "type") typeCommand(args);
-  else if (cmd == "pwd")  pwdCommand();
-  else if (cmd == "exit") _exit(0);              // subshell: exit ends this stage only
-  else                    externalProgram(args); // execs, or exits on not-found
+
+  // Redirections and pipe fds are already in place, so a builtin with a child
+  // handler runs here and its output flows wherever the caller pointed it.
+  // Everything else — including builtins that only exist parent-side — falls
+  // through to the PATH lookup.
+  const Builtin *builtin = find_builtin(args[0]);
+  if (builtin && builtin->child) builtin->child(args);
+  else                           externalProgram(args);  // execs, or exits on not-found
   _exit(0);
 }
 
@@ -95,7 +66,7 @@ vector<string> get_command_completions(const string &prefix) {
 
   set<string> unique_matches;
 
-  for (const auto& target : builtinCommands) {
+  for (const auto& target : builtin_names()) {
     if (target.rfind(prefix, 0) == 0) {
       unique_matches.insert(target);
     }
@@ -316,45 +287,12 @@ void executeCommand(const vector<string> &args) {
 
   string cmd = splitwords[0];
 
-  if (cmd == "exit") {
-    exit(0);
-  }
-  if (cmd == "cd") {
-    if (splitwords.size() < 2) return;
-    string target = splitwords[1];
-    if (target == "~") {
-      const char* home = getenv("HOME");
-      target = home ? home : "";
-    }
-    if (fs::exists(target) && fs::is_directory(target)) {
-      fs::current_path(target);
-    } else {
-      cout << "cd: " << splitwords[1] << ": No such file or directory\n";
-    }
-    return;
-  }
-
-  // Parent-side: complete mutates shell state that must outlive one command.
-  if (cmd == "complete") {
-    if (splitwords.size() >= 3 && splitwords[1] == "-p") {
-      const string& name = splitwords[2];
-      string script = lookup_completion_spec(name);
-      if (!script.empty()) {
-        cout << "complete -C '" << script << "' " << name << "\n";
-      } else {
-        cout << "complete: " << name << ": no completion specification\n";
-      }
-    } else if (splitwords.size() >= 4 && splitwords[1] == "-C") {
-      register_completion_spec(splitwords[3], splitwords[2]);
-    } else if (splitwords.size() >= 3 && splitwords[1] == "-r") {
-      remove_completion_spec(splitwords[2]);
-    }
-    return;
-  }
-
-  // Parent-side: jobs reaps finished jobs and lists all in job-number order.
-  if (cmd == "jobs") {
-    reap_jobs(/*also_list_running=*/true);
+  // Parent-side builtins mutate state that must outlive this command — the
+  // working directory, the completion table, the job table — so they run here
+  // in the shell process instead of being forked away.
+  const Builtin *builtin = find_builtin(cmd);
+  if (builtin && builtin->parent) {
+    builtin->parent(splitwords);
     return;
   }
 
