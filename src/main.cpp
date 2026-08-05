@@ -17,11 +17,20 @@ using namespace std;
 namespace fs = std::filesystem;
 
 // Single source of truth for builtins; type + completion derive from this.
-const vector<string> builtinCommands = {"echo", "exit", "pwd", "cd", "type", "complete"};
+const vector<string> builtinCommands = {"echo", "exit", "pwd", "cd", "type", "complete", "jobs"};
 const unordered_set<string> listCommands(builtinCommands.begin(), builtinCommands.end());
 
 // command -> completer script path, registered via `complete -C`.
 map<string, string> completionSpecs;
+
+// Background jobs launched with `&`, keyed by sequential job number.
+// A job stays in the table only while running; "Done" is reported once at reap
+// time and never stored, so status is derived, not a field.
+struct BackgroundJob {
+  pid_t pid;
+  string command;
+};
+map<int, BackgroundJob> jobTable;
 
 struct RedirectionConfig {
   bool active = false;
@@ -422,10 +431,75 @@ RedirectionConfig parse_redirection(const vector<string> &splitwords) {
   return config;
 }
 
+// ---- Background job reaping ----
+
+// The two most-recently-started job ids (0 if absent), for the +/- markers.
+pair<int, int> current_and_previous_ids() {
+  int max_id = jobTable.empty() ? 0 : jobTable.rbegin()->first;
+  int second_id = 0;
+  if (jobTable.size() >= 2) {
+    auto it = jobTable.rbegin();
+    ++it;
+    second_id = it->first;
+  }
+  return {max_id, second_id};
+}
+
+char job_marker(int id, int max_id, int second_id) {
+  if (id == max_id) return '+';
+  if (id == second_id) return '-';
+  return ' ';
+}
+
+// One listing line. `running` picks the status text AND whether '&' is shown.
+void print_job_line(int id, char marker, const string& command, bool running) {
+  string field = running ? "Running" : "Done";
+  if (field.size() < 24) field.append(24 - field.size(), ' ');
+  cout << "[" << id << "]" << marker << "  " << field << command;
+  if (running) cout << " &";
+  cout << "\n";
+}
+
+// Poll every background job; return the ids that exited normally (reaping their
+// zombies as a side effect). Does NOT modify the table — detection only.
+set<int> poll_exited_jobs() {
+  set<int> exited;
+  for (const auto& [id, job] : jobTable) {
+    int status;
+    pid_t r = waitpid(job.pid, &status, WNOHANG);
+    if (r == job.pid && WIFEXITED(status)) exited.insert(id);
+  }
+  return exited;
+}
+
+// Reap finished jobs. Markers are computed on the FULL table and lines are
+// emitted in job-number order, so a Done job prints in its numeric position.
+// Pre-prompt sweep passes also_list_running=false (Done lines only); the `jobs`
+// builtin passes true (list every job). Exited jobs are removed afterward, so a
+// Done line is emitted exactly once by whichever call runs first.
+void reap_jobs(bool also_list_running) {
+  set<int> exited = poll_exited_jobs();
+  if (exited.empty() && !also_list_running) return;
+
+  auto [max_id, second_id] = current_and_previous_ids();
+  for (const auto& [id, job] : jobTable) {
+    bool running = (exited.count(id) == 0);
+    if (running && !also_list_running) continue;   // sweep: skip still-running
+    print_job_line(id, job_marker(id, max_id, second_id), job.command, running);
+  }
+
+  for (int id : exited) jobTable.erase(id);
+}
+
 // ---- Command routing ----
 
-void executeCommand(const vector<string> &splitwords) {
+void executeCommand(const vector<string> &args) {
+  if (args.empty()) return;
+
+  bool background = (args.back() == "&");
+  vector<string> splitwords(args.begin(), args.end() - (background ? 1 : 0));
   if (splitwords.empty()) return;
+
   string cmd = splitwords[0];
 
   if (cmd == "exit") {
@@ -461,6 +535,12 @@ void executeCommand(const vector<string> &splitwords) {
     } else if (splitwords.size() >= 3 && splitwords[1] == "-r") {
       completionSpecs.erase(splitwords[2]);
     }
+    return;
+  }
+
+  // Parent-side: jobs reaps finished jobs and lists all in job-number order.
+  if (cmd == "jobs") {
+    reap_jobs(/*also_list_running=*/true);
     return;
   }
 
@@ -503,8 +583,20 @@ void executeCommand(const vector<string> &splitwords) {
     exit(0);
   }
   else {
-    int status;
-    waitpid(pid, &status, 0);
+    if (background) {
+      string joined;
+      for (size_t i = 0; i < splitwords.size(); ++i) {
+        if (i) joined += " ";
+        joined += splitwords[i];
+      }
+      // Recycle numbers: reuse freed slots instead of growing forever.
+      int job_id = jobTable.empty() ? 1 : jobTable.rbegin()->first + 1;
+      jobTable[job_id] = {pid, joined};
+      cout << "[" << job_id << "] " << pid << "\n";
+    } else {
+      int status;
+      waitpid(pid, &status, 0);
+    }
   }
 }
 
@@ -515,6 +607,7 @@ int main() {
   std::cerr << std::unitbuf;
 
   while (true) {
+    reap_jobs(/*also_list_running=*/false);   // report+clear finished jobs first
     cout << "$ " << std::flush;
 
     string command_line = read_line_raw();
