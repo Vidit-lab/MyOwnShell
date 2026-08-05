@@ -100,6 +100,21 @@ void externalProgram(const vector<string> &splitwords) {
   exit(1);
 }
 
+// Run one command in the CURRENT process — used inside a forked child (a
+// pipeline stage, or a single command whose redirection is already applied).
+// Output-producing builtins run in-process so their stdout reaches the
+// redirected fd (file or pipe); everything else execs. Never returns.
+void runInProcess(const vector<string> &args) {
+  if (args.empty()) _exit(0);
+  const string &cmd = args[0];
+  if (cmd == "echo")      echoCommand(args);
+  else if (cmd == "type") typeCommand(args);
+  else if (cmd == "pwd")  pwdCommand();
+  else if (cmd == "exit") _exit(0);              // subshell: exit ends this stage only
+  else                    externalProgram(args); // execs, or exits on not-found
+  _exit(0);
+}
+
 // ---- Argument parser (quote/escape aware) ----
 
 void splitwords(const string &command, vector<string> &splitted) {
@@ -570,17 +585,7 @@ void executeCommand(const vector<string> &args) {
       close(file_fd);
     }
 
-    string child_cmd = active_args[0];
-    if (child_cmd == "echo") {
-      echoCommand(active_args);
-    } else if (child_cmd == "type") {
-      typeCommand(active_args);
-    } else if (child_cmd == "pwd") {
-      pwdCommand();
-    } else {
-      externalProgram(active_args);
-    }
-    exit(0);
+    runInProcess(active_args);
   }
   else {
     if (background) {
@@ -601,6 +606,10 @@ void executeCommand(const vector<string> &args) {
 }
 
 // ---- Pipelines ----
+
+// Two external commands joined by '|': left's stdout feeds right's stdin.
+// The parent must close BOTH pipe ends so `wc`-style readers see EOF and
+// `tail -f | head` gets SIGPIPE once the reader exits.
 void runPipeline(const vector<string> &tokens) {
   size_t bar = 0;
   while (bar < tokens.size() && tokens[bar] != "|") ++bar;
@@ -616,7 +625,7 @@ void runPipeline(const vector<string> &tokens) {
     dup2(fds[1], STDOUT_FILENO);   // left writes into the pipe
     close(fds[0]);
     close(fds[1]);
-    externalProgram(left);         // execs, or prints "not found" and exits
+    runInProcess(left);            // builtin in-process, else exec
     _exit(1);
   }
 
@@ -625,7 +634,7 @@ void runPipeline(const vector<string> &tokens) {
     dup2(fds[0], STDIN_FILENO);    // right reads from the pipe
     close(fds[0]);
     close(fds[1]);
-    externalProgram(right);
+    runInProcess(right);
     _exit(1);
   }
 
