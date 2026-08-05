@@ -23,9 +23,6 @@ const unordered_set<string> listCommands(builtinCommands.begin(), builtinCommand
 // command -> completer script path, registered via `complete -C`.
 map<string, string> completionSpecs;
 
-// Background jobs launched with `&`, keyed by sequential job number.
-// A job stays in the table only while running; "Done" is reported once at reap
-// time and never stored, so status is derived, not a field.
 struct BackgroundJob {
   pid_t pid;
   string command;
@@ -100,10 +97,6 @@ void externalProgram(const vector<string> &splitwords) {
   exit(1);
 }
 
-// Run one command in the CURRENT process — used inside a forked child (a
-// pipeline stage, or a single command whose redirection is already applied).
-// Output-producing builtins run in-process so their stdout reaches the
-// redirected fd (file or pipe); everything else execs. Never returns.
 void runInProcess(const vector<string> &args) {
   if (args.empty()) _exit(0);
   const string &cmd = args[0];
@@ -220,8 +213,6 @@ vector<string> get_command_completions(const string &prefix) {
   return vector<string>(unique_matches.begin(), unique_matches.end());
 }
 
-// Argument words: files/dirs matching the word. A word like "src/ma" scans
-// "src/" and matches "ma"; each candidate is the full word form for splicing.
 vector<string> get_file_completions(const string &word) {
   size_t slash = word.find_last_of('/');
   string dir_part = (slash == string::npos) ? "" : word.substr(0, slash + 1);
@@ -259,11 +250,6 @@ string longest_common_prefix(const vector<string>& v) {
   return p;
 }
 
-// ---- Raw-mode line editor with Tab completion ----
-
-// Run a registered completer script, feeding it bash's standard completion
-// args (command name, current word, previous word), and return its stdout
-// lines as candidates.
 vector<string> run_completer(const string& script, const string& cmd_name,
                              const string& cur_word, const string& prev_word,
                              const string& comp_line, size_t comp_point) {
@@ -475,8 +461,6 @@ void print_job_line(int id, char marker, const string& command, bool running) {
   cout << "\n";
 }
 
-// Poll every background job; return the ids that exited normally (reaping their
-// zombies as a side effect). Does NOT modify the table — detection only.
 set<int> poll_exited_jobs() {
   set<int> exited;
   for (const auto& [id, job] : jobTable) {
@@ -487,11 +471,6 @@ set<int> poll_exited_jobs() {
   return exited;
 }
 
-// Reap finished jobs. Markers are computed on the FULL table and lines are
-// emitted in job-number order, so a Done job prints in its numeric position.
-// Pre-prompt sweep passes also_list_running=false (Done lines only); the `jobs`
-// builtin passes true (list every job). Exited jobs are removed afterward, so a
-// Done line is emitted exactly once by whichever call runs first.
 void reap_jobs(bool also_list_running) {
   set<int> exited = poll_exited_jobs();
   if (exited.empty() && !also_list_running) return;
@@ -607,41 +586,49 @@ void executeCommand(const vector<string> &args) {
 
 // ---- Pipelines ----
 
-// Two external commands joined by '|': left's stdout feeds right's stdin.
-// The parent must close BOTH pipe ends so `wc`-style readers see EOF and
-// `tail -f | head` gets SIGPIPE once the reader exits.
+// Split a token list on '|' into its command stages: ["cat","f","|","wc"] -> {["cat","f"], ["wc"]}.
+vector<vector<string>> split_on_pipe(const vector<string> &tokens) {
+  vector<vector<string>> stages;
+  vector<string> cur;
+  for (const auto &t : tokens) {
+    if (t == "|") { stages.push_back(cur); cur.clear(); }
+    else cur.push_back(t);
+  }
+  stages.push_back(cur);
+  return stages;
+}
+
 void runPipeline(const vector<string> &tokens) {
-  size_t bar = 0;
-  while (bar < tokens.size() && tokens[bar] != "|") ++bar;
-  vector<string> left(tokens.begin(), tokens.begin() + bar);
-  vector<string> right(tokens.begin() + bar + 1, tokens.end());
-  if (left.empty() || right.empty()) return;
+  vector<vector<string>> stages = split_on_pipe(tokens);
+  int n = (int)stages.size();
 
-  int fds[2];
-  if (pipe(fds) < 0) { perror("pipe failed"); return; }
+  int prev_read = -1;                 // read end feeding the current stage's stdin
+  vector<pid_t> pids;
 
-  pid_t p1 = fork();
-  if (p1 == 0) {
-    dup2(fds[1], STDOUT_FILENO);   // left writes into the pipe
-    close(fds[0]);
-    close(fds[1]);
-    runInProcess(left);            // builtin in-process, else exec
-    _exit(1);
+  for (int i = 0; i < n; ++i) {
+    bool has_next = (i < n - 1);
+    int fds[2] = {-1, -1};
+    if (has_next && pipe(fds) < 0) { perror("pipe failed"); break; }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+      if (prev_read != -1) dup2(prev_read, STDIN_FILENO);   // stdin from previous stage
+      if (has_next)        dup2(fds[1], STDOUT_FILENO);      // stdout to next stage
+      if (prev_read != -1) close(prev_read);
+      if (has_next) { close(fds[0]); close(fds[1]); }
+      runInProcess(stages[i]);        // builtin in-process, else exec
+      _exit(1);
+    }
+
+    pids.push_back(pid);
+    if (prev_read != -1) close(prev_read);   // parent is done with the incoming read end
+    if (has_next) {
+      close(fds[1]);                          // parent never writes
+      prev_read = fds[0];                      // hand the read end to the next stage
+    }
   }
 
-  pid_t p2 = fork();
-  if (p2 == 0) {
-    dup2(fds[0], STDIN_FILENO);    // right reads from the pipe
-    close(fds[0]);
-    close(fds[1]);
-    runInProcess(right);
-    _exit(1);
-  }
-
-  close(fds[0]);                    // parent holds neither end
-  close(fds[1]);
-  waitpid(p1, nullptr, 0);
-  waitpid(p2, nullptr, 0);
+  for (pid_t p : pids) waitpid(p, nullptr, 0);
 }
 
 // ---- Main loop ----
