@@ -22,6 +22,10 @@ add_executable(myshell
   src/parser/tokenizer.cpp
   src/parser/redirection.cpp
 
+  src/exec/executor.cpp
+  src/exec/external.cpp
+  src/exec/pipeline.cpp
+
   src/builtins/registry.cpp
   src/builtins/echo.cpp
   src/builtins/pwd.cpp

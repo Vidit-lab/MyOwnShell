@@ -1,7 +1,8 @@
 #include "builtins/builtins.hpp"
 #include "completion/completion_specs.hpp"
+#include "exec/executor.hpp"
+#include "exec/pipeline.hpp"
 #include "jobs/job_control.hpp"
-#include "parser/redirection.hpp"
 #include "parser/tokenizer.hpp"
 #include "util/path.hpp"
 #include "util/string_utils.hpp"
@@ -23,40 +24,6 @@
 
 using namespace std;
 namespace fs = std::filesystem;
-
-// ---- Program execution ----
-
-void externalProgram(const vector<string> &splitwords) {
-  string cmd = splitwords[0];
-  string filepath = find_executable(cmd);
-  if (filepath.empty()) {
-    cerr << cmd << ": not found\n";
-    exit(1);
-  }
-
-  vector<char *> argv;
-  for (auto &a : splitwords) {
-    argv.push_back(const_cast<char*>(a.c_str()));
-  }
-  argv.push_back(nullptr);
-
-  execv(filepath.c_str(), argv.data());
-  perror("execv failed");
-  exit(1);
-}
-
-void runInProcess(const vector<string> &args) {
-  if (args.empty()) _exit(0);
-
-  // Redirections and pipe fds are already in place, so a builtin with a child
-  // handler runs here and its output flows wherever the caller pointed it.
-  // Everything else — including builtins that only exist parent-side — falls
-  // through to the PATH lookup.
-  const Builtin *builtin = find_builtin(args[0]);
-  if (builtin && builtin->child) builtin->child(args);
-  else                           externalProgram(args);  // execs, or exits on not-found
-  _exit(0);
-}
 
 // ---- Completion engines ----
 
@@ -274,111 +241,6 @@ string read_line_raw() {
 
   tcsetattr(STDIN_FILENO, TCSANOW, &original_terminal);
   return current_line;
-}
-
-// ---- Command routing ----
-
-void executeCommand(const vector<string> &args) {
-  if (args.empty()) return;
-
-  bool background = (args.back() == "&");
-  vector<string> splitwords(args.begin(), args.end() - (background ? 1 : 0));
-  if (splitwords.empty()) return;
-
-  string cmd = splitwords[0];
-
-  // Parent-side builtins mutate state that must outlive this command — the
-  // working directory, the completion table, the job table — so they run here
-  // in the shell process instead of being forked away.
-  const Builtin *builtin = find_builtin(cmd);
-  if (builtin && builtin->parent) {
-    builtin->parent(splitwords);
-    return;
-  }
-
-  pid_t pid = fork();
-  if (pid == -1) {
-    perror("fork failed");
-    return;
-  }
-
-  if (pid == 0) {
-    RedirectionConfig redir = parse_redirection(splitwords);
-
-    vector<string> active_args = splitwords;
-    if (redir.active) {
-      active_args.resize(redir.operator_idx);
-    }
-
-    if (active_args.empty()) exit(0);
-
-    if (redir.active) {
-      int file_fd = open(redir.file.c_str(), redir.open_flags, 0644);
-      if (file_fd < 0) {
-        perror("open failed");
-        exit(1);
-      }
-      dup2(file_fd, redir.target_fd);
-      close(file_fd);
-    }
-
-    runInProcess(active_args);
-  }
-  else {
-    if (background) {
-      register_background_job(pid, join(splitwords, " "));
-    } else {
-      int status;
-      waitpid(pid, &status, 0);
-    }
-  }
-}
-
-// ---- Pipelines ----
-
-// Split a token list on '|' into its command stages: ["cat","f","|","wc"] -> {["cat","f"], ["wc"]}.
-vector<vector<string>> split_on_pipe(const vector<string> &tokens) {
-  vector<vector<string>> stages;
-  vector<string> cur;
-  for (const auto &t : tokens) {
-    if (t == "|") { stages.push_back(cur); cur.clear(); }
-    else cur.push_back(t);
-  }
-  stages.push_back(cur);
-  return stages;
-}
-
-void runPipeline(const vector<string> &tokens) {
-  vector<vector<string>> stages = split_on_pipe(tokens);
-  int n = (int)stages.size();
-
-  int prev_read = -1;                 // read end feeding the current stage's stdin
-  vector<pid_t> pids;
-
-  for (int i = 0; i < n; ++i) {
-    bool has_next = (i < n - 1);
-    int fds[2] = {-1, -1};
-    if (has_next && pipe(fds) < 0) { perror("pipe failed"); break; }
-
-    pid_t pid = fork();
-    if (pid == 0) {
-      if (prev_read != -1) dup2(prev_read, STDIN_FILENO);   // stdin from previous stage
-      if (has_next)        dup2(fds[1], STDOUT_FILENO);      // stdout to next stage
-      if (prev_read != -1) close(prev_read);
-      if (has_next) { close(fds[0]); close(fds[1]); }
-      runInProcess(stages[i]);        // builtin in-process, else exec
-      _exit(1);
-    }
-
-    pids.push_back(pid);
-    if (prev_read != -1) close(prev_read);   // parent is done with the incoming read end
-    if (has_next) {
-      close(fds[1]);                          // parent never writes
-      prev_read = fds[0];                      // hand the read end to the next stage
-    }
-  }
-
-  for (pid_t p : pids) waitpid(p, nullptr, 0);
 }
 
 // ---- Main loop ----
