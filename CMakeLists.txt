@@ -18,6 +18,12 @@ endif()
 
 add_executable(myshell
   src/main.cpp
+
+  src/parser/tokenizer.cpp
+  src/parser/redirection.cpp
+
+  src/util/path.cpp
+  src/util/string_utils.cpp
 )
 
 target_include_directories(myshell PRIVATE src)

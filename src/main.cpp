@@ -1,3 +1,8 @@
+#include "parser/redirection.hpp"
+#include "parser/tokenizer.hpp"
+#include "util/path.hpp"
+#include "util/string_utils.hpp"
+
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -29,14 +34,6 @@ struct BackgroundJob {
 };
 map<int, BackgroundJob> jobTable;
 
-struct RedirectionConfig {
-  bool active = false;
-  string file = "";
-  int target_fd = STDOUT_FILENO;
-  int open_flags = O_WRONLY | O_CREAT;
-  size_t operator_idx = 0;
-};
-
 // ---- Built-in handlers ----
 
 void echoCommand(const vector<string> &p) {
@@ -59,41 +56,30 @@ void typeCommand(const vector<string> &splitwords) {
     return;
   }
 
-  const char* env_path = getenv("PATH");
-  string pathvar = env_path ? env_path : "";
-  istringstream path_stream(pathvar);
-  string pathsplit;
-  while (getline(path_stream, pathsplit, ':')) {
-    string filepath = pathsplit + '/' + cmd;
-    if (access(filepath.c_str(), X_OK) == 0) {
-      cout << cmd << " is " << filepath << endl;
-      return;
-    }
+  string filepath = find_executable(cmd);
+  if (!filepath.empty()) {
+    cout << cmd << " is " << filepath << endl;
+    return;
   }
   cout << cmd << ": not found\n";
 }
 
 void externalProgram(const vector<string> &splitwords) {
   string cmd = splitwords[0];
-  const char* env_path = getenv("PATH");
-  string pathvar = env_path ? env_path : "";
-  istringstream path_stream(pathvar);
-  string pathsplit;
-  while (getline(path_stream, pathsplit, ':')) {
-    string filepath = pathsplit + '/' + cmd;
-    if (access(filepath.c_str(), X_OK) == 0) {
-      vector<char *> argv;
-      for (auto &a : splitwords) {
-        argv.push_back(const_cast<char*>(a.c_str()));
-      }
-      argv.push_back(nullptr);
-
-      execv(filepath.c_str(), argv.data());
-      perror("execv failed");
-      exit(1);
-    }
+  string filepath = find_executable(cmd);
+  if (filepath.empty()) {
+    cerr << cmd << ": not found\n";
+    exit(1);
   }
-  cerr << cmd << ": not found\n";
+
+  vector<char *> argv;
+  for (auto &a : splitwords) {
+    argv.push_back(const_cast<char*>(a.c_str()));
+  }
+  argv.push_back(nullptr);
+
+  execv(filepath.c_str(), argv.data());
+  perror("execv failed");
   exit(1);
 }
 
@@ -106,68 +92,6 @@ void runInProcess(const vector<string> &args) {
   else if (cmd == "exit") _exit(0);              // subshell: exit ends this stage only
   else                    externalProgram(args); // execs, or exits on not-found
   _exit(0);
-}
-
-// ---- Argument parser (quote/escape aware) ----
-
-void splitwords(const string &command, vector<string> &splitted) {
-  string current_arg = "";
-  bool in_single_quotes = false;
-  bool in_double_quotes = false;
-  bool inside_word = false;
-
-  for (size_t i = 0; i < command.length(); ++i) {
-    char c = command[i];
-
-    if (in_single_quotes) {
-      if (c == '\'') in_single_quotes = false;
-      else current_arg += c;
-    } else if (in_double_quotes) {
-      if (c == '\\') {
-        if (i + 1 < command.length()) {
-          char next_c = command[i + 1];
-          if (next_c == '"' || next_c == '\\' || next_c == '$' || next_c == '`') {
-            i++;
-            current_arg += next_c;
-          } else if (next_c == '\n') {
-            i++;
-          } else {
-            current_arg += c;
-          }
-        } else {
-          current_arg += c;
-        }
-      } else if (c == '"') {
-        in_double_quotes = false;
-      } else {
-        current_arg += c;
-      }
-    } else {
-      if (c == '\\') {
-        if (i + 1 < command.length()) {
-          i++;
-          current_arg += command[i];
-          inside_word = true;
-        }
-      } else if (c == '\'') {
-        in_single_quotes = true;
-        inside_word = true;
-      } else if (c == '"') {
-        in_double_quotes = true;
-        inside_word = true;
-      } else if (c == ' ') {
-        if (inside_word) {
-          splitted.push_back(current_arg);
-          current_arg = "";
-          inside_word = false;
-        }
-      } else {
-        current_arg += c;
-        inside_word = true;
-      }
-    }
-  }
-  if (inside_word) splitted.push_back(current_arg);
 }
 
 // ---- Completion engines ----
@@ -184,12 +108,7 @@ vector<string> get_command_completions(const string &prefix) {
     }
   }
 
-  const char* env_path = getenv("PATH");
-  string pathvar = env_path ? env_path : "";
-  istringstream path_stream(pathvar);
-  string pathsplit;
-
-  while (getline(path_stream, pathsplit, ':')) {
+  for (const string &pathsplit : path_entries()) {
     if (pathsplit.empty() || !fs::exists(pathsplit) || !fs::is_directory(pathsplit)) continue;
 
     try {
@@ -236,18 +155,6 @@ vector<string> get_file_completions(const string &word) {
 
   sort(matches.begin(), matches.end());
   return matches;
-}
-
-string longest_common_prefix(const vector<string>& v) {
-  if (v.empty()) return "";
-  string p = v[0];
-  for (size_t i = 1; i < v.size(); ++i) {
-    size_t j = 0;
-    while (j < p.size() && j < v[i].size() && p[j] == v[i][j]) ++j;
-    p.resize(j);
-    if (p.empty()) break;
-  }
-  return p;
 }
 
 vector<string> run_completer(const string& script, const string& cmd_name,
@@ -337,8 +244,7 @@ string read_line_raw() {
       if (completing_command) {
         matches = get_command_completions(word);
       } else {
-        vector<string> head_tokens;
-        splitwords(line_head, head_tokens);
+        vector<string> head_tokens = tokenize(line_head);
         string command_name = head_tokens.empty() ? "" : head_tokens.front();
         string prev_word    = head_tokens.empty() ? "" : head_tokens.back();
         auto it = completionSpecs.find(command_name);
@@ -404,32 +310,6 @@ string read_line_raw() {
 
   tcsetattr(STDIN_FILENO, TCSANOW, &original_terminal);
   return current_line;
-}
-
-// ---- Redirection parsing ----
-
-RedirectionConfig parse_redirection(const vector<string> &splitwords) {
-  RedirectionConfig config;
-
-  for (size_t i = 0; i < splitwords.size(); ++i) {
-    const string &token = splitwords[i];
-    bool is_stdout_trunc  = (token == ">" || token == "1>");
-    bool is_stderr_trunc  = (token == "2>");
-    bool is_stdout_append = (token == ">>" || token == "1>>");
-    bool is_stderr_append = (token == "2>>");
-
-    if (is_stdout_trunc || is_stderr_trunc || is_stdout_append || is_stderr_append) {
-      if (i + 1 < splitwords.size()) {
-        config.active = true;
-        config.file = splitwords[i + 1];
-        config.operator_idx = i;
-        config.target_fd = (is_stderr_trunc || is_stderr_append) ? STDERR_FILENO : STDOUT_FILENO;
-        config.open_flags |= (is_stdout_append || is_stderr_append) ? O_APPEND : O_TRUNC;
-        break;
-      }
-    }
-  }
-  return config;
 }
 
 // ---- Background job reaping ----
@@ -568,11 +448,7 @@ void executeCommand(const vector<string> &args) {
   }
   else {
     if (background) {
-      string joined;
-      for (size_t i = 0; i < splitwords.size(); ++i) {
-        if (i) joined += " ";
-        joined += splitwords[i];
-      }
+      string joined = join(splitwords, " ");
       // Recycle numbers: reuse freed slots instead of growing forever.
       int job_id = jobTable.empty() ? 1 : jobTable.rbegin()->first + 1;
       jobTable[job_id] = {pid, joined};
@@ -643,8 +519,7 @@ int main() {
 
     string command_line = read_line_raw();
 
-    vector<string> splitcommand;
-    splitwords(command_line, splitcommand);
+    vector<string> splitcommand = tokenize(command_line);
 
     if (find(splitcommand.begin(), splitcommand.end(), "|") != splitcommand.end())
       runPipeline(splitcommand);
