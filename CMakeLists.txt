@@ -37,6 +37,11 @@ add_executable(myshell
 
   src/jobs/job_control.cpp
 
+  src/line/terminal.cpp
+  src/line/line_reader.cpp
+
+  src/completion/completion.cpp
+  src/completion/external_completer.cpp
   src/completion/completion_specs.cpp
 
   src/util/path.cpp

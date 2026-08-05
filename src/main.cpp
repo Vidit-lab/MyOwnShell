@@ -1,249 +1,21 @@
-#include "builtins/builtins.hpp"
-#include "completion/completion_specs.hpp"
 #include "exec/executor.hpp"
 #include "exec/pipeline.hpp"
 #include "jobs/job_control.hpp"
+#include "line/line_reader.hpp"
 #include "parser/tokenizer.hpp"
-#include "util/path.hpp"
-#include "util/string_utils.hpp"
 
+#include <algorithm>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <vector>
-#include <unordered_set>
-#include <set>
-#include <map>
-#include <algorithm>
-#include <cstdlib>
-#include <filesystem>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <termios.h>
 
 using namespace std;
-namespace fs = std::filesystem;
-
-// ---- Completion engines ----
-
-// First word: builtins + executables on PATH.
-vector<string> get_command_completions(const string &prefix) {
-  if (prefix.empty()) return {};
-
-  set<string> unique_matches;
-
-  for (const auto& target : builtin_names()) {
-    if (target.rfind(prefix, 0) == 0) {
-      unique_matches.insert(target);
-    }
-  }
-
-  for (const string &pathsplit : path_entries()) {
-    if (pathsplit.empty() || !fs::exists(pathsplit) || !fs::is_directory(pathsplit)) continue;
-
-    try {
-      for (const auto& entry : fs::directory_iterator(pathsplit)) {
-        try {
-          if (fs::is_directory(entry.path())) continue;
-
-          string filename = entry.path().filename().string();
-          if (filename.rfind(prefix, 0) == 0 && access(entry.path().string().c_str(), X_OK) == 0) {
-            unique_matches.insert(filename);
-          }
-        } catch (...) {
-          continue;
-        }
-      }
-    } catch (...) {
-      continue;
-    }
-  }
-
-  return vector<string>(unique_matches.begin(), unique_matches.end());
-}
-
-vector<string> get_file_completions(const string &word) {
-  size_t slash = word.find_last_of('/');
-  string dir_part = (slash == string::npos) ? "" : word.substr(0, slash + 1);
-  string leaf     = (slash == string::npos) ? word : word.substr(slash + 1);
-
-  string scan_dir = dir_part.empty() ? "." : dir_part;
-
-  vector<string> matches;
-  error_code ec;
-  if (!fs::is_directory(scan_dir, ec)) return matches;
-
-  bool want_hidden = !leaf.empty() && leaf[0] == '.';
-
-  for (const auto& entry : fs::directory_iterator(scan_dir, ec)) {
-    string name = entry.path().filename().string();
-    if (!want_hidden && !name.empty() && name[0] == '.') continue;
-    if (name.rfind(leaf, 0) == 0) {
-      matches.push_back(dir_part + name);
-    }
-  }
-
-  sort(matches.begin(), matches.end());
-  return matches;
-}
-
-vector<string> run_completer(const string& script, const string& cmd_name,
-                             const string& cur_word, const string& prev_word,
-                             const string& comp_line, size_t comp_point) {
-  int fds[2];
-  if (pipe(fds) < 0) return {};
-
-  pid_t pid = fork();
-  if (pid < 0) { close(fds[0]); close(fds[1]); return {}; }
-
-  if (pid == 0) {
-    dup2(fds[1], STDOUT_FILENO);
-    close(fds[0]);
-    close(fds[1]);
-    setenv("COMP_LINE", comp_line.c_str(), 1);
-    setenv("COMP_POINT", to_string(comp_point).c_str(), 1);
-    vector<char*> argv = {
-      const_cast<char*>(script.c_str()),
-      const_cast<char*>(cmd_name.c_str()),
-      const_cast<char*>(cur_word.c_str()),
-      const_cast<char*>(prev_word.c_str()),
-      nullptr
-    };
-    execv(script.c_str(), argv.data());
-    _exit(127);
-  }
-
-  close(fds[1]);
-  string out;
-  char buf[4096];
-  ssize_t n;
-  while ((n = read(fds[0], buf, sizeof(buf))) > 0) out.append(buf, n);
-  close(fds[0]);
-  waitpid(pid, nullptr, 0);
-
-  vector<string> lines;
-  istringstream iss(out);
-  string line;
-  while (getline(iss, line)) {
-    if (!line.empty()) lines.push_back(line);
-  }
-  return lines;
-}
-
-string read_line_raw() {
-  struct termios original_terminal;
-  if (tcgetattr(STDIN_FILENO, &original_terminal) < 0) {
-    string fallback_line;
-    if (!getline(cin, fallback_line)) exit(0);
-    return fallback_line;
-  }
-
-  struct termios raw_terminal = original_terminal;
-  raw_terminal.c_lflag &= ~(ICANON | ECHO);
-  tcsetattr(STDIN_FILENO, TCSANOW, &raw_terminal);
-
-  string current_line = "";
-  char ch;
-  bool prev_tab = false;
-
-  while (true) {
-    ssize_t n = read(STDIN_FILENO, &ch, 1);
-
-    if (n <= 0) {
-      if (current_line.empty()) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &original_terminal);
-        cout << endl;
-        exit(0);            // Ctrl-D on an empty line exits
-      }
-      break;                // partial line: run what we have
-    }
-
-    if (ch == '\n') {
-      cout << endl;
-      break;
-    }
-    else if (ch == '\t') {
-      // Complete the last word: first word => command, otherwise => filename.
-      size_t sp = current_line.find_last_of(' ');
-      bool completing_command = (sp == string::npos);
-      string word      = completing_command ? current_line : current_line.substr(sp + 1);
-      string line_head = completing_command ? ""           : current_line.substr(0, sp + 1);
-
-      vector<string> matches;
-      bool from_filesystem = false;
-      if (completing_command) {
-        matches = get_command_completions(word);
-      } else {
-        vector<string> head_tokens = tokenize(line_head);
-        string command_name = head_tokens.empty() ? "" : head_tokens.front();
-        string prev_word    = head_tokens.empty() ? "" : head_tokens.back();
-        string spec = lookup_completion_spec(command_name);
-        if (!spec.empty()) {
-          matches = run_completer(spec, command_name, word, prev_word,
-                                  current_line, current_line.length());
-        } else {
-          matches = get_file_completions(word);
-          from_filesystem = true;
-        }
-      }
-
-      if (matches.empty()) {
-        cout << "\a" << std::flush;
-        prev_tab = false;
-      } else if (matches.size() == 1) {
-        const string& sole = matches[0];
-        bool is_dir = from_filesystem && fs::is_directory(sole);
-        string suffix = is_dir ? "/" : " ";   // dir keeps you moving, file closes the token
-
-        string appended = sole.substr(word.length()) + suffix;
-        current_line = line_head + sole + suffix;
-        cout << appended << std::flush;
-        prev_tab = false;
-      } else {
-        string lcp = longest_common_prefix(matches);
-        if (lcp.size() > word.size()) {
-          string appended = lcp.substr(word.length());
-          current_line = line_head + lcp;
-          cout << appended << std::flush;
-          prev_tab = false;
-        } else if (!prev_tab) {
-          cout << "\a" << std::flush;   // first Tab: bell
-          prev_tab = true;
-        } else {
-          // second Tab: list basenames alphabetically, dirs marked with '/'
-          cout << "\n";
-          for (size_t i = 0; i < matches.size(); ++i) {
-            if (i > 0) cout << "  ";
-            const string& m = matches[i];
-            string base = m.substr(m.find_last_of('/') + 1);
-            if (from_filesystem && fs::is_directory(m)) base += "/";
-            cout << base;
-          }
-          cout << "\n$ " << current_line << std::flush;
-          prev_tab = false;
-        }
-      }
-    }
-    else if (ch == 127 || ch == 8) {
-      if (!current_line.empty()) {
-        current_line.pop_back();
-        cout << "\b \b" << std::flush;
-      }
-      prev_tab = false;
-    }
-    else {
-      current_line += ch;
-      cout << ch << std::flush;
-      prev_tab = false;
-    }
-  }
-
-  tcsetattr(STDIN_FILENO, TCSANOW, &original_terminal);
-  return current_line;
-}
 
 // ---- Main loop ----
+
+namespace {
+const string kPrompt = "$ ";
+}
 
 int main() {
   std::cout << std::unitbuf;
@@ -251,9 +23,9 @@ int main() {
 
   while (true) {
     reap_jobs(/*also_list_running=*/false);   // report+clear finished jobs first
-    cout << "$ " << std::flush;
+    cout << kPrompt << std::flush;
 
-    string command_line = read_line_raw();
+    string command_line = read_line_raw(kPrompt);
 
     vector<string> splitcommand = tokenize(command_line);
 
