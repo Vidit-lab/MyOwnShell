@@ -19,6 +19,8 @@ endif()
 add_executable(myshell
   src/main.cpp
 
+  src/core/shell.cpp
+
   src/parser/tokenizer.cpp
   src/parser/redirection.cpp
 
