@@ -1,3 +1,5 @@
+#include "completion/completion_specs.hpp"
+#include "jobs/job_control.hpp"
 #include "parser/redirection.hpp"
 #include "parser/tokenizer.hpp"
 #include "util/path.hpp"
@@ -24,15 +26,6 @@ namespace fs = std::filesystem;
 // Single source of truth for builtins; type + completion derive from this.
 const vector<string> builtinCommands = {"echo", "exit", "pwd", "cd", "type", "complete", "jobs"};
 const unordered_set<string> listCommands(builtinCommands.begin(), builtinCommands.end());
-
-// command -> completer script path, registered via `complete -C`.
-map<string, string> completionSpecs;
-
-struct BackgroundJob {
-  pid_t pid;
-  string command;
-};
-map<int, BackgroundJob> jobTable;
 
 // ---- Built-in handlers ----
 
@@ -247,9 +240,9 @@ string read_line_raw() {
         vector<string> head_tokens = tokenize(line_head);
         string command_name = head_tokens.empty() ? "" : head_tokens.front();
         string prev_word    = head_tokens.empty() ? "" : head_tokens.back();
-        auto it = completionSpecs.find(command_name);
-        if (it != completionSpecs.end()) {
-          matches = run_completer(it->second, command_name, word, prev_word,
+        string spec = lookup_completion_spec(command_name);
+        if (!spec.empty()) {
+          matches = run_completer(spec, command_name, word, prev_word,
                                   current_line, current_line.length());
         } else {
           matches = get_file_completions(word);
@@ -312,59 +305,6 @@ string read_line_raw() {
   return current_line;
 }
 
-// ---- Background job reaping ----
-
-// The two most-recently-started job ids (0 if absent), for the +/- markers.
-pair<int, int> current_and_previous_ids() {
-  int max_id = jobTable.empty() ? 0 : jobTable.rbegin()->first;
-  int second_id = 0;
-  if (jobTable.size() >= 2) {
-    auto it = jobTable.rbegin();
-    ++it;
-    second_id = it->first;
-  }
-  return {max_id, second_id};
-}
-
-char job_marker(int id, int max_id, int second_id) {
-  if (id == max_id) return '+';
-  if (id == second_id) return '-';
-  return ' ';
-}
-
-// One listing line. `running` picks the status text AND whether '&' is shown.
-void print_job_line(int id, char marker, const string& command, bool running) {
-  string field = running ? "Running" : "Done";
-  if (field.size() < 24) field.append(24 - field.size(), ' ');
-  cout << "[" << id << "]" << marker << "  " << field << command;
-  if (running) cout << " &";
-  cout << "\n";
-}
-
-set<int> poll_exited_jobs() {
-  set<int> exited;
-  for (const auto& [id, job] : jobTable) {
-    int status;
-    pid_t r = waitpid(job.pid, &status, WNOHANG);
-    if (r == job.pid && WIFEXITED(status)) exited.insert(id);
-  }
-  return exited;
-}
-
-void reap_jobs(bool also_list_running) {
-  set<int> exited = poll_exited_jobs();
-  if (exited.empty() && !also_list_running) return;
-
-  auto [max_id, second_id] = current_and_previous_ids();
-  for (const auto& [id, job] : jobTable) {
-    bool running = (exited.count(id) == 0);
-    if (running && !also_list_running) continue;   // sweep: skip still-running
-    print_job_line(id, job_marker(id, max_id, second_id), job.command, running);
-  }
-
-  for (int id : exited) jobTable.erase(id);
-}
-
 // ---- Command routing ----
 
 void executeCommand(const vector<string> &args) {
@@ -398,16 +338,16 @@ void executeCommand(const vector<string> &args) {
   if (cmd == "complete") {
     if (splitwords.size() >= 3 && splitwords[1] == "-p") {
       const string& name = splitwords[2];
-      auto it = completionSpecs.find(name);
-      if (it != completionSpecs.end()) {
-        cout << "complete -C '" << it->second << "' " << name << "\n";
+      string script = lookup_completion_spec(name);
+      if (!script.empty()) {
+        cout << "complete -C '" << script << "' " << name << "\n";
       } else {
         cout << "complete: " << name << ": no completion specification\n";
       }
     } else if (splitwords.size() >= 4 && splitwords[1] == "-C") {
-      completionSpecs[splitwords[3]] = splitwords[2];
+      register_completion_spec(splitwords[3], splitwords[2]);
     } else if (splitwords.size() >= 3 && splitwords[1] == "-r") {
-      completionSpecs.erase(splitwords[2]);
+      remove_completion_spec(splitwords[2]);
     }
     return;
   }
@@ -448,11 +388,7 @@ void executeCommand(const vector<string> &args) {
   }
   else {
     if (background) {
-      string joined = join(splitwords, " ");
-      // Recycle numbers: reuse freed slots instead of growing forever.
-      int job_id = jobTable.empty() ? 1 : jobTable.rbegin()->first + 1;
-      jobTable[job_id] = {pid, joined};
-      cout << "[" << job_id << "] " << pid << "\n";
+      register_background_job(pid, join(splitwords, " "));
     } else {
       int status;
       waitpid(pid, &status, 0);
